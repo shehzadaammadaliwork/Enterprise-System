@@ -1,0 +1,1515 @@
+// Prisma schema for the Enterprise Internal System.
+// Organized into per-module sections. Modules never query another module's
+// tables directly at the application layer — only the schema lives together.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =========================================================================
+// Module 1 — Authentication
+// =========================================================================
+
+model User {
+  id           String  @id @default(uuid())
+  email        String  @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  isActive     Boolean @default(true)
+
+  /// True only for the single bootstrap admin account created by the seed
+  /// script (see prisma/seed.ts's seedBootstrapAdmin) — never set for any
+  /// other user, including other accounts later granted the Admin role
+  /// through normal RBAC assignment. Exists solely to keep that one
+  /// account from ever being linked to an Employee profile (see
+  /// EmployeesService.createEmployee and the "Add employee" user picker).
+  isSystemAccount Boolean @default(false)
+
+  // Account lockout
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+
+  // Two-factor authentication (TOTP)
+  twoFactorEnabled Boolean @default(false)
+  twoFactorSecret  String? // encrypted at rest via FieldEncryptionService
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  roles                 UserRole[]
+  sessions              Session[]
+  loginHistory          LoginHistory[]
+  passwordResetOtps     PasswordResetOtp[]
+  passwordResetSessions PasswordResetSession[]
+  auditLogs             AuditLog[]
+  employee              Employee?
+
+  @@index([email])
+  @@map("users")
+}
+
+/// A logged-in session backed by a refresh token. Listing + revoking sessions
+/// (spec: "Session list + revoke") operates on this table.
+model Session {
+  id               String    @id @default(uuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash String    @unique
+  userAgent        String?
+  ip               String?
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  replacedByHash   String?
+  /// "Remember me" — whether the refresh-token cookie should survive a
+  /// browser restart (persistent) or be a session cookie. Carried forward
+  /// on every token-rotation so a remembered session doesn't silently
+  /// downgrade to session-only on its next silent refresh.
+  persistent       Boolean   @default(true)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+/// A password-reset code requested via POST /auth/forgot-password. Only the
+/// hash of the 6-digit code is stored — never the raw code. `attempts`
+/// backs the brute-force guard in AuthService.verifyResetCode; once it hits
+/// passwordReset.otpMaxAttempts the row is consumed (locked out) rather than
+/// left guessable, so a new code must be requested.
+model PasswordResetOtp {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash   String
+  attempts   Int       @default(0)
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@map("password_reset_otps")
+}
+
+/// Short-lived, single-purpose token issued by POST /auth/verify-reset-code
+/// once the OTP checks out. Its only job is authorizing one
+/// POST /auth/reset-password call — never exposed to the user as something
+/// they type in themselves, and consumed (or superseded by a fresh
+/// forgot-password request) so it can't be replayed.
+model PasswordResetSession {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@map("password_reset_sessions")
+}
+
+enum LoginOutcome {
+  SUCCESS
+  FAILED_NOT_FOUND
+  FAILED_PASSWORD
+  FAILED_LOCKED
+  FAILED_INACTIVE
+  FAILED_2FA
+  FAILED_RESET_OTP
+  PASSWORD_RESET_SUCCESS
+}
+
+model LoginHistory {
+  id        String       @id @default(uuid())
+  userId    String?
+  user      User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  email     String
+  ip        String?
+  userAgent String?
+  outcome   LoginOutcome
+  createdAt DateTime     @default(now())
+
+  @@index([userId])
+  @@index([email])
+  @@map("login_history")
+}
+
+// =========================================================================
+// Module 2 — RBAC
+// =========================================================================
+
+enum PermissionAction {
+  VIEW
+  CREATE
+  EDIT
+  DELETE
+}
+
+/// One row per (module, action) pair, e.g. ("employees", CREATE).
+/// The set of valid module slugs is maintained in code at
+/// src/common/constants/modules.constant.ts and seeded via the RBAC seeder.
+model Permission {
+  id          String           @id @default(uuid())
+  module      String
+  action      PermissionAction
+  description String?
+  roles       RolePermission[]
+  overrides   EmployeePermissionOverride[]
+
+  @@unique([module, action])
+  @@map("permissions")
+}
+
+model Role {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  description String?
+  /// System roles (from Section 3 of the spec) cannot be deleted.
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@map("roles")
+}
+
+model RolePermission {
+  id           String     @id @default(uuid())
+  roleId       String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roleId    String
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, roleId])
+  @@map("user_roles")
+}
+
+enum PermissionOverrideState {
+  GRANTED
+  DENIED
+}
+
+/// Per-employee, per-permission adjustment layered on top of the employee's
+/// combined (Allow-wins union) role permissions — "Inherited" is simply the
+/// absence of a row here, never stored explicitly, so an employee with no
+/// customizations has zero rows (not a full duplicated permission set).
+/// A formal @relation to Employee (Employees module) is used here, same
+/// precedent as UserRole's own @relation to User (Auth module) just above —
+/// the architecture rule about cross-module boundaries is about
+/// service-layer query boundaries, not the schema graph (see CLAUDE.md).
+model EmployeePermissionOverride {
+  id           String                   @id @default(uuid())
+  employeeId   String
+  employee     Employee                 @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  permissionId String
+  permission   Permission               @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  state        PermissionOverrideState
+  createdAt    DateTime                 @default(now())
+  updatedAt    DateTime                 @updatedAt
+
+  @@unique([employeeId, permissionId])
+  @@index([employeeId])
+  @@map("employee_permission_overrides")
+}
+
+// =========================================================================
+// Module 4 — Organization Management
+// =========================================================================
+
+/// Singleton row (id is always SINGLETON_ID, enforced in the service layer —
+/// there is exactly one company profile per deployment).
+model CompanyProfile {
+  id                   String   @id @default(uuid())
+  name                 String
+  fiscalYearStartMonth Int      @default(1) // 1-12 (e.g. 4 = fiscal year starts in April)
+  workingHoursStart    String   @default("09:00") // "HH:mm", 24h
+  workingHoursEnd      String   @default("18:00")
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@map("company_profile")
+}
+
+model Branch {
+  id             String   @id @default(uuid())
+  name           String
+  addressLine1   String?
+  addressLine2   String?
+  city           String?
+  state          String?
+  country        String?
+  postalCode     String?
+  phone          String?
+  isHeadquarters Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  departments Department[]
+
+  @@map("branches")
+}
+
+model Department {
+  id            String       @id @default(uuid())
+  name          String
+  code          String?
+  branchId      String?
+  branch        Branch?      @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  parentId      String?
+  parent        Department?  @relation("DepartmentHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children      Department[] @relation("DepartmentHierarchy")
+  /// Plain reference to a User id (no formal relation) — Organization
+  /// never queries the Auth module's tables directly (Architecture Rule,
+  /// Section 2); the API layer resolves this id via the shared user lookup
+  /// when it needs to display a name.
+  managerUserId String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  employees Employee[]
+
+  @@index([branchId])
+  @@index([parentId])
+  @@map("departments")
+}
+
+model CompanyHoliday {
+  id                String   @id @default(uuid())
+  name              String
+  date              DateTime
+  description       String?
+  /// If true, this holiday recurs every year on the same month/day
+  /// regardless of the year component stored in `date`.
+  recurringAnnually Boolean  @default(false)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([date])
+  @@map("company_holidays")
+}
+
+// =========================================================================
+// Module 5 — Employee Management (HRM)
+// =========================================================================
+
+enum EmploymentStatus {
+  ACTIVE
+  INACTIVE
+  TERMINATED
+}
+
+model Employee {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  designation  String
+  joiningDate  DateTime
+
+  reportingManagerId String?
+  reportingManager   Employee?  @relation("EmployeeManager", fields: [reportingManagerId], references: [id], onDelete: SetNull)
+  directReports      Employee[] @relation("EmployeeManager")
+
+  /// Encrypted at rest via FieldEncryptionService (Architecture Rule,
+  /// Section 2: "salary, bank details are encrypted at rest").
+  salaryEncrypted String
+
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  country      String?
+  postalCode   String?
+
+  emergencyContactName     String?
+  emergencyContactPhone    String?
+  emergencyContactRelation String?
+
+  status EmploymentStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  attendanceRecords  AttendanceRecord[]
+  leaveRequests      LeaveRequest[]
+  payslipItems       PayslipItem[]
+  payrollAdjustments PayrollAdjustment[]
+  performanceReviews PerformanceReview[]
+  permissionOverrides EmployeePermissionOverride[]
+
+  @@index([departmentId])
+  @@index([reportingManagerId])
+  @@map("employees")
+}
+
+model AttendanceRecord {
+  id         String    @id @default(uuid())
+  employeeId String
+  employee   Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  /// Midnight UTC of the workday this record covers.
+  date       DateTime
+  checkInAt  DateTime?
+  checkOutAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@unique([employeeId, date])
+  @@index([employeeId])
+  @@map("attendance_records")
+}
+
+enum LeaveType {
+  SICK
+  CASUAL
+  ANNUAL
+  UNPAID
+  OTHER
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model LeaveRequest {
+  id              String      @id @default(uuid())
+  employeeId      String
+  employee        Employee    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveType       LeaveType
+  startDate       DateTime
+  endDate         DateTime
+  reason          String?
+  status          LeaveStatus @default(PENDING)
+  /// Plain User id reference, same pattern as Department.managerUserId —
+  /// RBAC's employees:EDIT permission is what actually gates who can
+  /// approve, not necessarily the employee's own reportingManager.
+  decidedByUserId String?
+  decidedAt       DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@index([employeeId])
+  @@index([status])
+  @@map("leave_requests")
+}
+
+enum PayrollRunStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+/// Which employees a run was generated for — ALL_ACTIVE is the historical
+/// default behavior; SELECTED covers a new hire's partial first month or a
+/// leaver's final settlement without re-running payroll for everyone else.
+enum PayrollRunScope {
+  ALL_ACTIVE
+  SELECTED
+}
+
+/// One run per (month, year), processed as a BullMQ background job
+/// (Architecture Rule, Section 2: "Monthly payroll generation ... run as a
+/// background job via BullMQ").
+model PayrollRun {
+  id                String           @id @default(uuid())
+  month             Int
+  year              Int
+  status            PayrollRunStatus @default(PENDING)
+  scope             PayrollRunScope  @default(ALL_ACTIVE)
+  /// Populated only when scope = SELECTED — the requested employee ids at
+  /// trigger time. `payslips` below is still the source of truth for who
+  /// actually got paid.
+  selectedEmployeeIds String[]       @default([])
+  triggeredByUserId String
+  errorMessage      String?
+  createdAt         DateTime         @default(now())
+  completedAt       DateTime?
+
+  payslips PayslipItem[]
+
+  /// Deliberately NOT unique on (month, year): a period can have more than
+  /// one run over time (e.g. an initial run for a subset of employees, then
+  /// a later top-up run for whoever wasn't covered yet). PayrollService
+  /// enforces the real invariant instead — no employee can appear in more
+  /// than one run's payslips for the same (month, year) — by only ever
+  /// targeting not-yet-covered employees when a new run is triggered for a
+  /// period that already has one.
+  @@index([month, year])
+  @@map("payroll_runs")
+}
+
+model PayslipItem {
+  id           String     @id @default(uuid())
+  payrollRunId String
+  payrollRun   PayrollRun @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  employeeId   String
+  employee     Employee   @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  /// Encrypted at rest, same as Employee.salaryEncrypted. grossEncrypted is
+  /// presented to clients as "Base Pay". bonusEncrypted/adjustmentDeductionEncrypted
+  /// come from a PayrollAdjustment staged for this employee/period before the
+  /// run, and are the only source of a deduction going forward — the system
+  /// never computes one on its own. deductionsEncrypted is the retired flat
+  /// 10% auto-deduction: historical runs keep whatever value they already
+  /// have (never rewritten — completed runs are locked), but it's never set
+  /// on new payslips and is no longer read or shown anywhere in the API.
+  grossEncrypted                String
+  bonusEncrypted                String?
+  deductionsEncrypted           String?
+  adjustmentDeductionEncrypted  String?
+  netEncrypted                  String
+
+  createdAt DateTime @default(now())
+
+  @@unique([payrollRunId, employeeId])
+  @@index([employeeId])
+  @@map("payslip_items")
+}
+
+/// Period-specific bonus/deduction staged for one employee before a payroll
+/// run for that (month, year) is triggered — read by PayrollService.processRun
+/// and copied onto the resulting PayslipItem. One-off: applies only to this
+/// period, never changes Employee.salaryEncrypted.
+model PayrollAdjustment {
+  id         String   @id @default(uuid())
+  month      Int
+  year       Int
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  /// Encrypted at rest, same as Employee.salaryEncrypted.
+  bonusEncrypted     String
+  deductionEncrypted String
+
+  createdByUserId String
+  updatedByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([month, year, employeeId])
+  @@index([employeeId])
+  @@map("payroll_adjustments")
+}
+
+model PerformanceReview {
+  id             String   @id @default(uuid())
+  employeeId     String
+  employee       Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  periodStart    DateTime
+  periodEnd      DateTime
+  rating         Int
+  notes          String?
+  reviewerUserId String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([employeeId])
+  @@map("performance_reviews")
+}
+
+// =========================================================================
+// Module 6 — Audit Logs (global interceptor writes here for every module)
+// =========================================================================
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+}
+
+model AuditLog {
+  id         String      @id @default(uuid())
+  userId     String?
+  user       User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userEmail  String?
+  action     AuditAction
+  module     String
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ip         String?
+  method     String?
+  path       String?
+  createdAt  DateTime    @default(now())
+
+  @@index([userId])
+  @@index([module])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// =========================================================================
+// Module 8 — CRM
+// =========================================================================
+
+enum LeadSource {
+  WEBSITE
+  REFERRAL
+  COLD_CALL
+  EVENT
+  ADVERTISEMENT
+  OTHER
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  CONVERTED
+  LOST
+}
+
+model Lead {
+  id          String     @id @default(uuid())
+  companyName String
+  contactName String
+  email       String?
+  phone       String?
+  source      LeadSource @default(OTHER)
+  status      LeadStatus @default(NEW)
+
+  /// Plain reference to a User id (no formal relation) — CRM never
+  /// queries the Auth module's tables directly (Architecture Rule,
+  /// Section 2); the API layer resolves this id via the shared user
+  /// lookup when it needs to display a name.
+  assignedToUserId String?
+
+  /// Set only by POST /crm/leads/:id/convert, alongside status: CONVERTED.
+  /// Not directly settable through the update DTO.
+  convertedToCustomerId String?   @unique
+  convertedCustomer     Customer? @relation("LeadConversion", fields: [convertedToCustomerId], references: [id], onDelete: SetNull)
+
+  notes Note[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([assignedToUserId])
+  @@map("crm_leads")
+}
+
+model Customer {
+  id           String  @id @default(uuid())
+  companyName  String
+  contactName  String
+  email        String?
+  phone        String?
+  addressLine1 String?
+  city         String?
+  country      String?
+
+  /// Back-relation only — populated when this customer originated from
+  /// a converted Lead (see Lead.convertedToCustomerId above).
+  convertedFromLead Lead? @relation("LeadConversion")
+
+  deals      Deal[]
+  activities Activity[]
+  notes      Note[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("crm_customers")
+}
+
+enum DealStage {
+  NEW
+  QUALIFIED
+  PROPOSAL
+  NEGOTIATION
+  WON
+  LOST
+}
+
+model Deal {
+  id    String @id @default(uuid())
+  title String
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  /// First plain (non-encrypted) money field in the schema — Decimal
+  /// avoids the floating-point rounding issues Float would introduce
+  /// for currency; the service layer converts to a JS number before
+  /// returning (see Deal.service's toPublicShape), mirroring how
+  /// employees.service.ts converts decrypted salary before returning.
+  value Decimal? @db.Decimal(12, 2)
+
+  stage             DealStage @default(NEW)
+  expectedCloseDate DateTime?
+
+  /// Plain reference to a User id — see Lead.assignedToUserId above.
+  assignedToUserId String?
+
+  notes Note[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId])
+  @@index([stage])
+  @@map("crm_deals")
+}
+
+enum ActivityType {
+  MEETING
+  CALL
+}
+
+/// A logged meeting or call against a customer. Append-only — no
+/// update/delete route, matching the AttendanceRecord/PayslipItem
+/// precedent for log-like records.
+model Activity {
+  id String @id @default(uuid())
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  type       ActivityType
+  subject    String
+  notes      String?
+  occurredAt DateTime
+
+  /// Plain reference to a User id — see Lead.assignedToUserId above.
+  loggedByUserId String?
+
+  createdAt DateTime @default(now())
+
+  @@index([customerId])
+  @@map("crm_activities")
+}
+
+/// Attachable to exactly one of Lead/Customer/Deal — Prisma has no
+/// native polymorphic relation, so this uses three nullable FKs rather
+/// than a stringly-typed entityType/entityId pair, preserving real
+/// referential integrity and cascade-delete behavior. The service layer
+/// enforces "exactly one of the three is set" at create time. Immutable
+/// once written — create + delete only, no update route.
+model Note {
+  id   String @id @default(uuid())
+  body String
+
+  leadId String?
+  lead   Lead?   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  dealId String?
+  deal   Deal?   @relation(fields: [dealId], references: [id], onDelete: Cascade)
+
+  /// Plain reference to a User id — see Lead.assignedToUserId above.
+  createdByUserId String?
+
+  createdAt DateTime @default(now())
+
+  @@index([leadId])
+  @@index([customerId])
+  @@index([dealId])
+  @@map("crm_notes")
+}
+
+// =========================================================================
+// Module 9 — Sales Management
+// =========================================================================
+
+enum ProductType {
+  PRODUCT
+  SERVICE
+}
+
+model Product {
+  id          String      @id @default(uuid())
+  name        String
+  description String?
+  type        ProductType @default(PRODUCT)
+  isActive    Boolean     @default(true)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  quoteItems QuoteItem[]
+  orderItems OrderItem[]
+
+  @@index([type])
+  @@map("sales_products")
+}
+
+enum QuoteStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CONVERTED
+}
+
+model Quote {
+  id     String @id @default(uuid())
+  /// Human-friendly sequential number (DB-native autoincrement — no
+  /// application-level counter/race condition to manage).
+  number Int    @unique @default(autoincrement())
+
+  /// Plain reference to a Customer id (CRM module) — Sales never queries
+  /// CRM's tables directly (Architecture Rule, Section 2); QuotesService
+  /// validates existence via CrmModule's exported CustomersService.
+  customerId String
+
+  /// Plain reference to a Deal id (CRM module) — nullable, since not every
+  /// quote originates from a tracked deal. Same cross-module-boundary
+  /// reasoning as customerId above: no formal @relation, since Deal and
+  /// Quote are owned by different modules. Carried forward onto the
+  /// resulting Order at conversion time (see Order.dealId) so the whole
+  /// Deal → Quote → Order → Invoice chain stays traceable, not just
+  /// Deal → Quote.
+  dealId String?
+
+  status     QuoteStatus @default(DRAFT)
+  validUntil DateTime?
+  notes      String?
+
+  /// Plain User id reference — see CRM's Lead.assignedToUserId precedent.
+  createdByUserId String
+
+  /// Set only by POST /sales/quotes/:id/convert, alongside status:
+  /// CONVERTED. Not directly settable through the update DTO — same
+  /// pattern as Lead.convertedToCustomerId.
+  convertedToOrderId String? @unique
+  convertedOrder     Order?  @relation("QuoteConversion", fields: [convertedToOrderId], references: [id], onDelete: SetNull)
+
+  items QuoteItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId])
+  @@index([status])
+  @@index([dealId])
+  @@map("sales_quotes")
+}
+
+/// Line item on a Quote. Snapshots Product.name/unitPrice/taxRatePercent
+/// at the time the line was added — a later catalog price change must
+/// not silently reprice an existing quote, mirroring PayslipItem's
+/// snapshot-at-generation-time pattern.
+model QuoteItem {
+  id      String @id @default(uuid())
+  quoteId String
+  quote   Quote  @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  description    String
+  quantity       Decimal @db.Decimal(10, 2)
+  unitPrice      Decimal @db.Decimal(12, 2)
+  taxRatePercent Decimal @db.Decimal(5, 2)
+  lineTotal      Decimal @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+
+  @@index([quoteId])
+  @@index([productId])
+  @@map("sales_quote_items")
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  FULFILLED
+  CANCELLED
+}
+
+/// Created only via POST /sales/quotes/:id/convert — there is no direct
+/// "create order" endpoint, matching the roadmap's "quotes → convert to
+/// orders" wording (unlike CRM's Customer, which can also be created
+/// directly without a Lead — a deliberate scope difference).
+model Order {
+  id     String @id @default(uuid())
+  number Int    @unique @default(autoincrement())
+
+  /// Copied from Quote.customerId at conversion time — see
+  /// Quote.customerId above for why this is a plain id, not a relation.
+  customerId String
+
+  /// Copied from Quote.dealId at conversion time (when set) — see
+  /// Quote.dealId above.
+  dealId String?
+
+  quote Quote? @relation("QuoteConversion")
+
+  status OrderStatus @default(PENDING)
+
+  /// Plain User id reference — see Quote.createdByUserId above.
+  createdByUserId String
+
+  items   OrderItem[]
+  invoice Invoice?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId])
+  @@index([status])
+  @@index([dealId])
+  @@map("sales_orders")
+}
+
+/// Line item on an Order, copied from the source QuoteItem at conversion
+/// time (same snapshot rationale as QuoteItem).
+model OrderItem {
+  id      String @id @default(uuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  description    String
+  quantity       Decimal @db.Decimal(10, 2)
+  unitPrice      Decimal @db.Decimal(12, 2)
+  taxRatePercent Decimal @db.Decimal(5, 2)
+  lineTotal      Decimal @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@index([productId])
+  @@map("sales_order_items")
+}
+
+enum InvoiceStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+/// Created only via POST /sales/orders/:id/invoice — one invoice per
+/// order (a deliberate scope reduction: the spec doesn't call for
+/// partial/multi-invoice billing per order; revisit if that requirement
+/// shows up, mirroring the Deal-pipeline-stages scope note in Module 8).
+model Invoice {
+  id     String @id @default(uuid())
+  number Int    @unique @default(autoincrement())
+
+  orderId String @unique
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  /// Denormalized from Order.customerId at generation time so invoice
+  /// listing/filtering doesn't need to join through Order.
+  customerId String
+
+  status      InvoiceStatus @default(UNPAID)
+  /// Snapshot of the order's item total at generation time — the
+  /// billed amount must stay fixed even if the order were hypothetically
+  /// revisited later. Outstanding balance is totalAmount minus the sum
+  /// of this invoice's Payments, computed in InvoicesService.
+  totalAmount Decimal       @db.Decimal(12, 2)
+  dueDate     DateTime?
+  issuedAt    DateTime      @default(now())
+
+  /// Plain User id reference — see Quote.createdByUserId above.
+  createdByUserId String
+
+  payments Payment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId])
+  @@index([status])
+  @@map("sales_invoices")
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  CARD
+  CHEQUE
+  OTHER
+}
+
+/// A payment recorded against an invoice. Append-only — no update/delete
+/// route, matching the Activity/PayslipItem precedent for financial log
+/// records.
+model Payment {
+  id        String  @id @default(uuid())
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  amount    Decimal       @db.Decimal(12, 2)
+  method    PaymentMethod @default(BANK_TRANSFER)
+  reference String?
+  paidAt    DateTime      @default(now())
+
+  /// Plain User id reference — see Quote.createdByUserId above.
+  recordedByUserId String
+
+  createdAt DateTime @default(now())
+
+  @@index([invoiceId])
+  @@map("sales_payments")
+}
+
+// =========================================================================
+// Module 10 — Finance Management
+// =========================================================================
+
+/// A bank account whose balance is tracked via the Transactions posted
+/// against it. Balance is never stored/denormalized here — it's always
+/// openingBalance + sum(APPROVED income) - sum(APPROVED expense),
+/// computed at query time in BankAccountsService (same pattern as
+/// Invoice.outstandingBalance in Module 9).
+model BankAccount {
+  id             String   @id @default(uuid())
+  name           String
+  bankName       String?
+  /// Not encrypted at rest (unlike Employee.salaryEncrypted) — this app
+  /// doesn't treat it as regulated PII, but it IS redacted in audit_logs
+  /// (see SENSITIVE_AUDIT_FIELD_NAMES) as defense in depth.
+  accountNumber  String?
+  openingBalance Decimal  @default(0) @db.Decimal(12, 2)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  transactions Transaction[]
+
+  @@map("finance_bank_accounts")
+}
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+}
+
+enum TransactionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// A single income or expense entry. Only APPROVED transactions count
+/// toward a BankAccount's balance or the P&L/cash-flow reports.
+/// INCOME transactions are approved automatically at creation (the spec
+/// only calls for an approval *workflow* on expenses); EXPENSE
+/// transactions start PENDING and require TransactionsService.decide()
+/// (mirrors LeaveService.decide() from Module 5) before they count.
+model Transaction {
+  id     String          @id @default(uuid())
+  type   TransactionType
+  /// Free-text, not a fixed enum — categories are business-specific and
+  /// open-ended (unlike e.g. Deal.stage); the frontend offers a curated
+  /// list per type but this field accepts anything. Grouped on in the P&L
+  /// report.
+  category    String
+  amount      Decimal  @db.Decimal(12, 2)
+  description String?
+  /// The date the money actually moved, which may differ from createdAt
+  /// (e.g. entering a bill received last week) — reports filter on this,
+  /// not createdAt.
+  transactionDate DateTime
+
+  bankAccountId String
+  bankAccount   BankAccount @relation(fields: [bankAccountId], references: [id], onDelete: Restrict)
+
+  status TransactionStatus @default(PENDING)
+
+  /// Plain User id reference — see CRM's Lead.assignedToUserId precedent.
+  createdByUserId String
+  decidedByUserId String?
+  decidedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([bankAccountId])
+  @@index([type])
+  @@index([status])
+  @@index([transactionDate])
+  @@map("finance_transactions")
+}
+
+// =========================================================================
+// Module 11 — Asset Management
+// =========================================================================
+// Redesigned from the roadmap's original "resale stock in warehouses" scope
+// to fit this business (software/services, no physical goods sold): tracks
+// individual company-owned equipment issued to employees, not stock
+// quantities. See MODULE_ROADMAP.md and PROJECT_STATUS.md for the full
+// rationale. RBAC slug stays `inventory` (already seeded) even though the
+// feature/UI name is "Asset Management".
+
+enum AssetCategory {
+  LAPTOP
+  MONITOR
+  PHONE
+  OTHER_EQUIPMENT
+}
+
+enum AssetStatus {
+  ASSIGNED
+  AVAILABLE
+  UNDER_REPAIR
+  RETIRED
+}
+
+/// One row per physical asset (e.g. one specific laptop), not a stock
+/// quantity. Retired assets are never deleted — see AssetsService for the
+/// status-transition matrix and the delete guard (only AVAILABLE assets are
+/// deletable, to fix mis-entered rows without letting history disappear).
+model Asset {
+  id       String        @id @default(uuid())
+  name     String
+  category AssetCategory
+  serialNumber String?
+
+  /// Populated automatically when created via a Purchase Request's "Mark
+  /// as Purchased" action (see PurchaseRequest below); editable/blank for
+  /// assets onboarded manually.
+  purchaseDate DateTime?
+  purchaseCost Decimal?  @db.Decimal(12, 2)
+
+  /// Plain id reference — Employee is owned by the Employees module
+  /// (Architecture Rule, Section 2). Set only while status is ASSIGNED;
+  /// cleared whenever status moves away from ASSIGNED.
+  assignedEmployeeId String?
+
+  status           AssetStatus @default(AVAILABLE)
+  retirementReason String?
+  notes            String?
+
+  /// Plain id reference back to the originating PurchaseRequest, if this
+  /// asset was created via Mark as Purchased (Internal Purchasing module).
+  purchaseRequestId String? @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([category])
+  @@index([assignedEmployeeId])
+  @@map("assets")
+}
+
+// =========================================================================
+// Module 12 — Internal Purchasing
+// =========================================================================
+// Redesigned from the roadmap's original vendor PO/goods-receipt scope to
+// an internal purchase-request-and-approval workflow — this business has no
+// vendor supply chain to manage. RBAC slug stays `procurement` (already
+// seeded) even though the feature/UI name is "Internal Purchasing".
+
+enum PurchaseRequestCategory {
+  EQUIPMENT
+  SOFTWARE_SUBSCRIPTION
+  OTHER
+}
+
+enum PurchaseRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PURCHASED
+}
+
+/// Pending -> Approved -> Purchased (Rejected reachable from Pending only).
+/// Approval alone creates no Expense/Asset — see PurchaseRequestsService
+/// .markPurchased, which is the only thing that does, using the actual
+/// amount entered there (not estimatedCost).
+model PurchaseRequest {
+  id     String @id @default(uuid())
+  number Int    @unique @default(autoincrement())
+
+  description   String
+  category      PurchaseRequestCategory
+  estimatedCost Decimal                 @db.Decimal(12, 2)
+  reason        String
+
+  status PurchaseRequestStatus @default(PENDING)
+
+  /// Plain User id reference — any authenticated user can submit a
+  /// request, same self-service precedent as Quote.createdByUserId.
+  requestedByUserId String
+
+  decidedByUserId String?
+  decidedAt       DateTime?
+
+  /// Set only by PATCH /purchase-requests/:id/mark-purchased, alongside
+  /// status: PURCHASED. May differ from estimatedCost.
+  actualAmount      Decimal?  @db.Decimal(12, 2)
+  purchasedByUserId String?
+  purchasedAt       DateTime?
+
+  /// Plain id references — Transaction is owned by Finance, Asset by
+  /// Asset Management. Both set together, only at Mark as Purchased.
+  linkedExpenseId String? @unique
+  linkedAssetId   String? @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([requestedByUserId])
+  @@map("purchase_requests")
+}
+
+// =========================================================================
+// Module 13 — Document Management
+// =========================================================================
+// Roadmap wording is "attach to any record (employee, customer, project)"
+// — this system has no Projects module, so `entityType` is deliberately a
+// free-form string, not an enum tied to specific models. Document
+// Management doesn't validate that (entityType, entityId) refers to a real
+// row (same plain-id, unvalidated-cross-module-reference precedent as
+// Department.managerUserId) — reaching into every other module's tables to
+// check would invert the dependency direction this generic, attach-to-
+// anything module needs to stay decoupled. Files live on disk via the
+// shared StorageService (common/storage/storage.service.ts) — this module
+// only ever touches storageKey strings, never the filesystem directly.
+
+enum DocumentAccessScope {
+  EVERYONE
+  SPECIFIC_ROLES
+  SPECIFIC_USERS
+}
+
+model Document {
+  id     String @id @default(uuid())
+  entityType String
+  entityId   String
+  title      String
+
+  accessScope DocumentAccessScope @default(EVERYONE)
+
+  /// Plain User id — the uploader of the first version.
+  uploadedByUserId String
+
+  versions     DocumentVersion[]
+  accessGrants DocumentAccessGrant[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([entityType, entityId])
+  @@map("documents")
+}
+
+/// Append-only — a re-upload adds a new row rather than overwriting the
+/// last one (spec: "version history on re-upload"), same precedent as
+/// QuoteItem/Payment snapshotting instead of mutating in place.
+model DocumentVersion {
+  id         String   @id @default(uuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  versionNumber Int
+
+  /// Relative key into StorageService's storage root — never an absolute
+  /// path (see StorageService's own doc comment on why).
+  storageKey       String
+  originalFileName String
+  mimeType         String
+  sizeBytes        Int
+  checksum         String
+
+  uploadedByUserId String
+
+  createdAt DateTime @default(now())
+
+  @@unique([documentId, versionNumber])
+  @@index([documentId])
+  @@map("document_versions")
+}
+
+/// One row per role/user granted access when accessScope is
+/// SPECIFIC_ROLES/SPECIFIC_USERS — exactly one of roleId/userId is set per
+/// row, enforced in DocumentsService rather than a DB constraint (same
+/// application-level-validation convention as AssetsService's
+/// assign-requires-employee rule). roleId/userId are plain ids — Role is
+/// owned by RBAC, User by Auth.
+model DocumentAccessGrant {
+  id         String   @id @default(uuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  roleId String?
+  userId String?
+
+  createdAt DateTime @default(now())
+
+  @@index([documentId])
+  @@map("document_access_grants")
+}
+
+// =========================================================================
+// Module 14 — Notification System
+// =========================================================================
+// `userId` on both models below is a plain User id, not a formal @relation
+// — same cross-module precedent as Document.uploadedByUserId (User is owned
+// by Auth, Notifications is its own module). Every endpoint in this module
+// is self-service (a user only ever reads their own notifications/prefs),
+// so there is deliberately no formal relation to walk from the User side.
+//
+// This system has no real email/SMS/push provider wired up anywhere yet
+// (see AuthService.forgotPassword's devResetToken — same gap, acknowledged
+// there as a "no provider yet" placeholder; Module 19 is where a real
+// transactional-email provider is scoped in). EMAIL/SMS/PUSH channels here
+// are fully real and job-driven (preference-checked, queued, dispatched by
+// NotificationsProcessor) but that processor logs a delivery stub for those
+// three channels rather than calling an actual provider. IN_APP is the one
+// fully real channel end-to-end: a persisted row plus a live WebSocket push.
+
+enum NotificationEventType {
+  LEAVE_REQUEST_SUBMITTED
+  LEAVE_REQUEST_DECIDED
+  PURCHASE_REQUEST_SUBMITTED
+  PURCHASE_REQUEST_DECIDED
+  SYSTEM_ANNOUNCEMENT
+  /// Added for Module 15 (Calendar Management) — the exact extension point
+  /// this enum's own doc comment anticipated: a new module calls
+  /// NotificationsService.notify() from wherever the triggering action
+  /// already lives, no changes needed to the notification infrastructure.
+  CALENDAR_EVENT_INVITED
+  CALENDAR_EVENT_REMINDER
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  SMS
+  PUSH
+}
+
+/// One row per delivered IN_APP notification — this is what read/unread
+/// state (spec requirement) is tracked against. Notifications on the other
+/// three channels are dispatched (see NotificationsProcessor) but leave no
+/// row here, since there is no "read" concept for an email/SMS/push.
+model Notification {
+  id        String                @id @default(uuid())
+  userId    String
+  eventType NotificationEventType
+  title     String
+  message   String
+  /// Small, event-specific payload for the frontend to deep-link with (e.g.
+  /// { leaveRequestId }) — deliberately untyped Json, same precedent as
+  /// AuditLog.before/after for a field that varies per producer.
+  data      Json?
+  readAt    DateTime?
+  createdAt DateTime              @default(now())
+
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+/// Per-(user, event type, channel) opt-out. Absence of a row means
+/// "enabled" (materialized as the default at read/check time, same
+/// zero-rows-needed-for-default convention as everywhere else in this
+/// schema that doesn't seed placeholder rows) — a brand-new user gets every
+/// channel for every event type until they explicitly turn one off.
+model NotificationPreference {
+  id        String                @id @default(uuid())
+  userId    String
+  eventType NotificationEventType
+  channel   NotificationChannel
+  enabled   Boolean               @default(true)
+
+  @@unique([userId, eventType, channel])
+  @@map("notification_preferences")
+}
+
+// =========================================================================
+// Module 15 — Calendar Management
+// =========================================================================
+// Roadmap wording is "Events (meeting/deadline/leave/holiday)" — rather
+// than duplicating Leave/Holiday data into this table (which would drift
+// out of sync with the real records the moment a leave request is
+// re-decided or a holiday edited), CalendarEvent only ever stores manually
+// created MEETING/DEADLINE entries. LEAVE/HOLIDAY rows shown on the
+// calendar are synthesized at read time by CalendarEventsService merging
+// in Employees' approved leave requests and Organization's company
+// holidays (via their exported services, read-only) — CalendarEventType
+// still carries all four values since the merged API response uses the
+// same shape for both real and synthetic entries, but CreateCalendarEventDto
+// only accepts MEETING/DEADLINE.
+//
+// "Shared department/company-wide calendar view" (roadmap wording) is read
+// as a filter dimension, not an access-restriction system — every
+// authenticated user with calendar:VIEW sees every event; ?departmentId=
+// narrows the view rather than gating who can see what (unlike Document
+// Management's per-record ACL, which the roadmap explicitly did ask for).
+
+enum CalendarEventType {
+  MEETING
+  DEADLINE
+  LEAVE
+  HOLIDAY
+}
+
+model CalendarEvent {
+  id          String            @id @default(uuid())
+  title       String
+  description String?
+  eventType   CalendarEventType
+  startAt     DateTime
+  endAt       DateTime
+  allDay      Boolean           @default(false)
+  location    String?
+
+  /// Plain id — Organization owns Department (Module 4). A loose tag for
+  /// the department-scoped view filter, not an access restriction; null
+  /// means "company-wide" (shown regardless of which department is filtered).
+  departmentId String?
+
+  /// Minutes before startAt to fire a reminder notification, via a BullMQ
+  /// delayed job keyed by this event's id (CalendarEventsService
+  /// schedule/cancel/reschedule on create/update/delete). Null = no reminder.
+  reminderMinutesBefore Int?
+
+  createdByUserId String
+
+  attendees CalendarEventAttendee[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([startAt])
+  @@index([departmentId])
+  @@map("calendar_events")
+}
+
+/// Plain User id per attendee, same unvalidated-plain-id precedent as
+/// Department.managerUserId/PurchaseRequest.requestedByUserId — the
+/// frontend resolves display names via the existing Employees list picker
+/// rather than this module adding its own user-lookup endpoint.
+model CalendarEventAttendee {
+  id      String        @id @default(uuid())
+  eventId String
+  event   CalendarEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  userId  String
+
+  @@unique([eventId, userId])
+  @@index([eventId])
+  @@map("calendar_event_attendees")
+}
+
+// =========================================================================
+// Module 18 — Settings
+// =========================================================================
+// A separate singleton from Module 4's CompanyProfile (name/fiscal
+// year/working hours) rather than an extension of it — branding/timezone/
+// currency is genuinely a different domain (system configuration vs.
+// company/HR identity) and keeps SettingsModule self-contained per the
+// architecture rule (modules never query another module's table directly).
+// Same findFirst()-or-create() singleton convention as CompanyProfile.
+
+model SystemSettings {
+  id                   String   @id @default(uuid())
+  brandLogoKey         String? // StorageService key for an uploaded logo, if any
+  brandPrimaryColor    String? // hex, e.g. "#2563eb"
+  timezone             String   @default("UTC") // IANA tz name
+  currencyCode         String   @default("USD") // ISO 4217
+  currencyLocale       String   @default("en-US") // Intl.NumberFormat locale, for display formatting
+  backupSchedule       String? // cron expression; null = scheduled backups disabled
+  backupRetentionCount Int      @default(7)
+  updatedByUserId      String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@map("system_settings")
+}
+
+/// Plaintext key is never stored — only its sha256 (high-entropy random
+/// token, not a user password, so a fast hash is the right tool) plus a
+/// short prefix for the list UI to display without ever re-exposing the
+/// full key after creation.
+model ApiKey {
+  id              String    @id @default(uuid())
+  label           String
+  keyPrefix       String
+  keyHash         String    @unique
+  createdByUserId String
+  lastUsedAt      DateTime?
+  expiresAt       DateTime?
+  revokedAt       DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@map("api_keys")
+}
+
+/// type/status/trigger are plain strings here, not Postgres enum types
+/// (unlike every other status-ish field in this schema, e.g. LeaveStatus,
+/// AssetStatus) — deliberately. backup_records/restore_records are
+/// excluded from every pg_dump BackupService takes (they're the backup
+/// system's own bookkeeping, not application data — see the exclusion
+/// comment in BackupService.dumpDatabase), but pg_dump still emits
+/// CREATE/DROP TYPE statements for any enum type that exists in the
+/// schema regardless of which tables were excluded. On restore,
+/// `pg_restore --clean` then tries to DROP TYPE a type these
+/// still-live, deliberately-untouched tables depend on, and fails.
+/// Plain strings (validated at the application layer — see
+/// settings/constants/backup.constants.ts) sidestep the whole problem;
+/// confirmed necessary by hitting exactly this failure in end-to-end
+/// restore testing.
+model BackupRecord {
+  id                String          @id @default(uuid())
+  type              String // DATABASE | STORAGE | FULL
+  status            String          @default("PENDING") // PENDING | RUNNING | SUCCEEDED | FAILED
+  trigger           String // MANUAL | SCHEDULED | PRE_RESTORE_SAFETY
+  filePath          String? // relative to BACKUP_ROOT, e.g. "<id>/"
+  fileSizeBytes     BigInt?
+  errorMessage      String?
+  triggeredByUserId String?
+  startedAt         DateTime        @default(now())
+  completedAt       DateTime?
+  restoredFrom      RestoreRecord[] @relation("RestoredFrom")
+  usedAsSafetyFor   RestoreRecord[] @relation("PreRestoreSafetyBackup")
+
+  @@map("backup_records")
+}
+
+/// The one destructive operation in this module gets its own audit trail,
+/// beyond the generic AuditLogInterceptor row — which backup it restored
+/// from, and which PRE_RESTORE_SAFETY backup was auto-taken immediately
+/// before the destructive step, so a bad restore is itself recoverable.
+model RestoreRecord {
+  id                 String        @id @default(uuid())
+  backupRecordId     String
+  backupRecord       BackupRecord  @relation("RestoredFrom", fields: [backupRecordId], references: [id])
+  preRestoreBackupId String?
+  preRestoreBackup   BackupRecord? @relation("PreRestoreSafetyBackup", fields: [preRestoreBackupId], references: [id])
+  status             String        @default("PENDING") // PENDING | RUNNING | SUCCEEDED | FAILED
+  triggeredByUserId  String
+  errorMessage       String?
+  startedAt          DateTime      @default(now())
+  completedAt        DateTime?
+
+  @@map("restore_records")
+}

@@ -1,0 +1,137 @@
+@import "tailwindcss";
+
+/* shadcn/ui's default dark-mode convention toggles a `.dark` class on
+   <html>; this app already has a working `data-theme` attribute mechanism
+   (useTheme.ts) with localStorage persistence + prefers-color-scheme
+   fallback, so the dark variant targets that instead of introducing a
+   second, redundant theme-switching mechanism. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+:root {
+  --radius: 0.625rem;
+  --text: #6b6375;
+  --text-h: #08060d;
+  --bg: #fff;
+  --bg-subtle: #f7f6f9;
+  --border: #e5e4e7;
+  --accent: #6d5bf5;
+  --accent-h: #5a47e0;
+  --accent-bg: rgba(109, 91, 245, 0.1);
+  --accent-border: rgba(109, 91, 245, 0.5);
+  --danger: #d1293d;
+  --danger-bg: rgba(209, 41, 61, 0.1);
+  --shadow:
+    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+
+  /* Brand gradient panel is fixed (not theme-dependent) — matches the
+     approved reference design in both light and dark mode. */
+  --brand-grad: linear-gradient(160deg, #6d5bf5 0%, #7c3aed 55%, #5a47e0 100%);
+  --brand-ink: #fff;
+  --brand-ink-soft: rgba(255, 255, 255, 0.75);
+  --brand-chip-bg: rgba(255, 255, 255, 0.12);
+
+  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --mono: ui-monospace, Consolas, monospace;
+
+  font: 16px/145% var(--sans);
+  color-scheme: light dark;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #9ca3af;
+    --text-h: #f3f4f6;
+    --bg: #16171d;
+    --bg-subtle: #1c1d24;
+    --border: #2e303a;
+    --accent: #8a7bff;
+    --accent-h: #a394ff;
+    --accent-bg: rgba(138, 123, 255, 0.15);
+    --accent-border: rgba(138, 123, 255, 0.5);
+    --danger: #f87171;
+    --danger-bg: rgba(248, 113, 113, 0.15);
+    --shadow:
+      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+  }
+}
+
+/* Manual override (see useTheme.ts) always wins over the media query. */
+:root[data-theme='dark'] {
+  --text: #9ca3af;
+  --text-h: #f3f4f6;
+  --bg: #16171d;
+  --bg-subtle: #1c1d24;
+  --border: #2e303a;
+  --accent: #8a7bff;
+  --accent-h: #a394ff;
+  --accent-bg: rgba(138, 123, 255, 0.15);
+  --accent-border: rgba(138, 123, 255, 0.5);
+  --danger: #f87171;
+  --danger-bg: rgba(248, 113, 113, 0.15);
+  --shadow:
+    rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+}
+
+:root[data-theme='light'] {
+  --text: #6b6375;
+  --text-h: #08060d;
+  --bg: #fff;
+  --bg-subtle: #f7f6f9;
+  --border: #e5e4e7;
+  --accent: #6d5bf5;
+  --accent-h: #5a47e0;
+  --accent-bg: rgba(109, 91, 245, 0.1);
+  --accent-border: rgba(109, 91, 245, 0.5);
+  --danger: #d1293d;
+  --danger-bg: rgba(209, 41, 61, 0.1);
+  --shadow:
+    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+}
+
+/* Maps shadcn/ui's semantic token names (consumed by every generated
+   component in src/components/ui/) onto this app's existing hand-rolled
+   design tokens above, rather than introducing a second, parallel color
+   system. Each entry is a *reference* (var(...)) to an existing token, so
+   light/dark switching (and the data-theme blocks above) keeps working
+   without redeclaring anything here. */
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --color-background: var(--bg);
+  --color-foreground: var(--text-h);
+  --color-card: var(--bg);
+  --color-card-foreground: var(--text-h);
+  --color-popover: var(--bg);
+  --color-popover-foreground: var(--text-h);
+  --color-primary: var(--accent);
+  --color-primary-foreground: #ffffff;
+  --color-secondary: var(--bg-subtle);
+  --color-secondary-foreground: var(--text-h);
+  --color-muted: var(--bg-subtle);
+  --color-muted-foreground: var(--text);
+  --color-accent: var(--bg-subtle);
+  --color-accent-foreground: var(--text-h);
+  --color-destructive: var(--danger);
+  --color-destructive-foreground: #ffffff;
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-ring: var(--accent);
+
+  --font-sans: var(--sans);
+  --font-mono: var(--mono);
+}
+
+body,
+#root {
+  min-height: 100svh;
+}
+

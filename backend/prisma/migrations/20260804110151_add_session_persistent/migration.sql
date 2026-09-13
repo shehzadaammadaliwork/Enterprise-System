@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "sessions" ADD COLUMN     "persistent" BOOLEAN NOT NULL DEFAULT true;
